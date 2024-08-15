@@ -4,6 +4,6 @@ python-dotenv
 langchain[all]
 PyPDF2
 chromadb
-faiss-cpu
+faiss-cpu==1.7.4
 langchain_google_genai
 langchain-community
