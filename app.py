@@ -1,4 +1,15 @@
+import re
+import time
+from io import BytesIO
+from typing import Any, Dict, List
+
+# Modules to Import
+import openai
 import streamlit as st
+from langchain import LLMChain, OpenAI
+from langchain.agents import AgentExecutor, Tool, ZeroShotAgent
+from langchain.chains import RetrievalQA
+from langchain.chains.question_answering import load_qa_chain
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
@@ -6,83 +17,138 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
+from langchain.docstore.document import Document
+from langchain.document_loaders import PyPDFLoader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.memory import ConversationBufferMemory
+from langchain.vectorstores.faiss import FAISS
+from pypdf import PdfReader
 
 
-load_dotenv()
-api_key="AIzaSyCGRIvxVFVa4kGDKhC-SGjuSrciWdKgLyg"
-genai.configure(api_key=api_key)
+@st.cache_data
+def parse_pdf(file: BytesIO) -> List[str]:
+    pdf = PdfReader(file)
+    output = []
+    for page in pdf.pages:
+        text = page.extract_text()
+        # Merge hyphenated words
+        text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
+        # Fix newlines in the middle of sentences
+        text = re.sub(r"(?<!\n\s)\n(?!\s\n)", " ", text.strip())
+        # Remove multiple newlines
+        text = re.sub(r"\n\s*\n", "\n\n", text)
+        output.append(text)
+    return output
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+@st.cache_data
+def text_to_docs(text: str) -> List[Document]:
+    """Converts a string or list of strings to a list of Documents
+    with metadata."""
+    if isinstance(text, str):
+        # Take a single string as one page
+        text = [text]
+    page_docs = [Document(page_content=page) for page in text]
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = text_splitter.split_text(text)
-    return chunks
+    # Add page numbers as metadata
+    for i, doc in enumerate(page_docs):
+        doc.metadata["page"] = i + 1
 
-def get_vector_store(text_chunks):
-    try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        embedded_texts = embeddings.embed_documents(text_chunks)
-        if embedded_texts:
-            print(f"Embedding dimension: {len(embedded_texts[0])}")
-        
-        vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index", allow_dangerous_deserialization=True)
-    except Exception as e:
-        print(f"Error creating vector store: {e}")
+    # Split pages into chunks
+    doc_chunks = []
 
-def get_conversational_chain():
-    prompt_template = """
-    Use the context given which is an epic for a warehuose automation software that make different rtp robot moves . answer the query based on information and your own knowledge , make sure to provide all the details\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
+    for doc in page_docs:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=4000,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+            chunk_overlap=0,
+        )
+        chunks = text_splitter.split_text(doc.page_content)
+        for i, chunk in enumerate(chunks):
+            doc = Document(
+                page_content=chunk, metadata={"page": doc.metadata["page"], "chunk": i}
+            )
+            # Add sources as metadata
+            doc.metadata["source"] = f"{doc.metadata['page']}-{doc.metadata['chunk']}"
+            doc_chunks.append(doc)
+    return doc_chunks
 
-    Answer:
-    """
-    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    return chain
+@st.cache_resource
+def test_embed():
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    # Indexing
+    # Save in a Vector DB
+    with st.spinner("It's indexing..."):
+        index = FAISS.from_documents(pages, embeddings)
+    st.success("Embeddings done.", icon="✅")
+    return index
 
-def user_input(user_question):
-    try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        docs = new_db.similarity_search(user_question)
-        chain = get_conversational_chain()
-        response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-        print(response)
-        st.write("Reply: ", response["output_text"])
-    except Exception as e:
-        st.write(f"Error processing user input: {e}")
+uploaded_file = st.file_uploader("**Upload Your PDF File**", type=["pdf"])
+if uploaded_file:
+    name_of_file = uploaded_file.name
+    doc = parse_pdf(uploaded_file)
+    pages = text_to_docs(doc)
+    if pages:
+        with st.expander("Show Page Content", expanded=False):
+            page_sel = st.number_input(
+                label="Select Page", min_value=1, max_value=len(pages), step=1
+            )
+            st.write(pages[page_sel - 1].page_content)
 
-def main():
-    st.set_page_config(page_title="TC Generator")
-    st.header("Upload Your Epic:")
-    user_question = st.text_input("Ask a Question from the PDF Files")
-    if user_question:
-        user_input(user_question)
-    with st.sidebar:
-        st.title("Menu:")
-        pdf_docs = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True)
-        if st.button("Submit & Process"):
-            with st.spinner("Processing..."):
-                try:
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-                    get_vector_store(text_chunks)
-                    st.success("Done")
-                except Exception as e:
-                    st.error(f"Error processing PDF files: {e}")
+        api = "AIzaSyCGRIvxVFVa4kGDKhC-SGjuSrciWdKgLyg"
+        genai.configure(api_key=api)
+        if api:
+            index = test_embed()
+            qa = RetrievalQA.from_chain_type(
+                llm=ChatGoogleGenerativeAI(model="gemini-1.5-flash-001"),
+                chain_type="stuff",
+                retriever=index.as_retriever(),
+            )
+            tools = [
+                Tool(
+                    name="State of Union QA System",
+                    func=qa.run,
+                    description="Useful for when you need to answer questions about the aspects asked. Input may be a partial or fully formed question.",
+                )
+            ]        
+            prefix = """Have a conversation with a human, answering the following questions as best you can based on the context and memory available. 
+                You have access to a single tool:"""
+            suffix = """Begin!"
+            {chat_history}
+            Question: {input}
+            {agent_scratchpad}"""
 
-if __name__ == "__main__":
-    main()
+            prompt = ZeroShotAgent.create_prompt(
+                tools,
+                prefix=prefix,
+                suffix=suffix,
+                input_variables=["input", "chat_history", "agent_scratchpad"],
+            )
+            if "memory" not in st.session_state:
+                st.session_state.memory = ConversationBufferMemory(
+                    memory_key="chat_history"
+                )
+
+            llm_chain = LLMChain(
+                llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-001"),
+                prompt=prompt,
+            )                        
+            agent = ZeroShotAgent(llm_chain=llm_chain, tools=tools, verbose=True)
+            agent_chain = AgentExecutor.from_agent_and_tools(
+                agent=agent, tools=tools, verbose=True, memory=st.session_state.memory
+            )     
+            query = st.text_input(
+                "**What's on your mind?**",
+                placeholder="Ask me anything from {}".format(name_of_file),
+            )
+
+            if query:
+                with st.spinner(
+                    "Generating Answer to your Query : `{}` ".format(query)
+                ):
+                    res = agent_chain.run(query)
+                    st.info(res, icon="🤖")
+
+            with st.expander("History/Memory"):
+                st.session_state.memory
